@@ -78,7 +78,7 @@ def test_remembered_port_round_trip_and_fallbacks():
     assert core._remembered_port("edge") == 9224
 
 
-# --- start attempts ------------------------------------------------------
+# --- starting and closing ----------------------------------------------
 
 
 class FakeProcess:
@@ -95,16 +95,6 @@ class FakeProcess:
         self.terminated = True
 
 
-def test_abandon_attempt_retries_then_raises():
-    server = core.CdpServer(9222, FakeProcess())
-    core._abandon_attempt(server, OSError("boom"), last_attempt=False)
-    assert server.process.terminated
-    with pytest.raises(RuntimeError, match="Could not attach"):
-        core._abandon_attempt(server, OSError("boom"), last_attempt=True)
-    with pytest.raises(KeyboardInterrupt):
-        core._abandon_attempt(server, KeyboardInterrupt(), last_attempt=False)
-
-
 def test_stop_process_waits_for_clean_exit():
     clean = FakeProcess(exits=True)
     core._stop_process(clean, timeout=0)
@@ -117,34 +107,64 @@ def test_stop_process_kills_a_hung_browser():
     assert hung.terminated
 
 
-def test_sync_close_asks_browser_to_close_before_detaching():
-    calls = []
-    cdp = SimpleNamespace(send=lambda method: calls.append(method))
-    session = core.BrowserSession(
-        playwright=SimpleNamespace(stop=lambda: calls.append("stop")),
-        browser=SimpleNamespace(new_browser_cdp_session=lambda: cdp),
+def _session(calls, process):
+    async def send(method):
+        calls.append(method)
+
+    async def new_browser_cdp_session():
+        return SimpleNamespace(send=send)
+
+    async def stop():
+        calls.append("stop")
+
+    return core.BrowserSession(
+        playwright=SimpleNamespace(stop=stop),
+        browser=SimpleNamespace(new_browser_cdp_session=new_browser_cdp_session),
         context=None,
         page=None,
         cdp_url="http://127.0.0.1:9222",
-        process=FakeProcess(),
+        process=process,
     )
-    session.close(terminate_process=True)
+
+
+def test_close_asks_launched_browser_to_close_before_detaching():
+    calls = []
+    session = _session(calls, FakeProcess())
+    asyncio.run(session.close(stop_browser=True))
     assert calls == ["Browser.close", "stop"]
     assert not session.process.terminated
 
 
-def test_sync_close_leaves_attached_browser_running():
+def test_close_leaves_attached_browser_running():
     calls = []
-    session = core.BrowserSession(
-        playwright=SimpleNamespace(stop=lambda: calls.append("stop")),
-        browser=SimpleNamespace(new_browser_cdp_session=lambda: pytest.fail("must not close")),
-        context=None,
-        page=None,
-        cdp_url="http://127.0.0.1:9222",
-        process=None,
-    )
-    session.close(terminate_process=True)
+    asyncio.run(_session(calls, process=None).close(stop_browser=True))
     assert calls == ["stop"]
+
+
+def test_start_session_retries_on_fresh_profile(monkeypatch):
+    stuck = core._CdpServer(9222, FakeProcess())
+    fresh_server = core._CdpServer(50000, FakeProcess())
+    monkeypatch.setattr(core, "_start_cdp", lambda browser, headless, *, fresh: fresh_server if fresh else stuck)
+
+    async def attach(url):
+        if url == stuck.url:
+            raise RuntimeError("stuck")
+        return SimpleNamespace(process=None)
+
+    monkeypatch.setattr(core, "_attach", attach)
+    session = asyncio.run(core._start_session("brave", headless=True))
+    assert stuck.process.terminated
+    assert session.process is fresh_server.process
+    assert core._remembered_port("brave") == 50000
+
+
+def test_solve_captcha_needs_an_endpoint_for_foreign_pages():
+    class UnknownBrowser:
+        pass
+
+    page = SimpleNamespace(context=SimpleNamespace(browser=UnknownBrowser()))
+    with pytest.raises(ValueError, match="cdp_url"):
+        asyncio.run(browser.solve_captcha(page))
 
 
 # --- navigation and scraping ---------------------------------------------
@@ -154,13 +174,11 @@ class FakePage:
     def __init__(self, status: int = 200):
         self.status = status
         self.url = "https://example.com"
-        self.goto_timeout = "unset"
         self.closed = False
 
-    async def goto(self, url, *, wait_until, timeout):
+    async def goto(self, url, *, wait_until):
         self.url = url
-        self.goto_timeout = timeout
-        return SimpleNamespace(status=self.status)
+        return SimpleNamespace(status=self.status, ok=self.status < 400)
 
     async def close(self):
         self.closed = True
@@ -185,16 +203,21 @@ def no_captcha(monkeypatch):
     monkeypatch.setattr(core, "has_captcha", has_captcha)
 
 
-@pytest.mark.parametrize(("timeout", "expected_ms"), [(None, None), (0, 0), (2.5, 2500)])
-def test_open_page_timeout(no_captcha, timeout, expected_ms):
-    page = FakePage()
-    asyncio.run(browser.open_page(page, "https://example.com", timeout=timeout))
-    assert page.goto_timeout == expected_ms
+def test_load_rejects_http_errors(no_captcha):
+    with pytest.raises(RuntimeError, match="HTTP 404 at https://x"):
+        asyncio.run(core._load(FakePage(status=404), "https://x"))
 
 
-def test_open_page_rejects_http_errors(no_captcha):
-    with pytest.raises(RuntimeError, match="Shop returned HTTP 404"):
-        asyncio.run(browser.open_page(FakePage(status=404), "https://x", site="Shop"))
+def test_load_skips_status_check_once_captcha_is_solved(monkeypatch):
+    async def has_captcha(page):
+        return True
+
+    async def solve_captcha(page):
+        return True
+
+    monkeypatch.setattr(core, "has_captcha", has_captcha)
+    monkeypatch.setattr(core, "solve_captcha", solve_captcha)
+    asyncio.run(core._load(FakePage(status=403), "https://x"))
 
 
 def _scrape(context, urls, on_error):
@@ -214,6 +237,6 @@ def test_scrape_pages_skip_keeps_results_aligned(no_captcha):
 
 def test_scrape_pages_raise_reports_failure(no_captcha):
     context = FakeContext(failing={"b"})
-    with pytest.raises(RuntimeError, match="scraping failed: bad b"):
+    with pytest.raises(ValueError, match="bad b"):
         _scrape(context, ["a", "b", "c"], "raise")
     assert all(page.closed for page in context.pages)

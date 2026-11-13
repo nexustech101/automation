@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 from types import SimpleNamespace
 
@@ -28,21 +27,7 @@ def test_package_exposes_public_api():
     assert browser.settings is core.settings
 
 
-# --- URLs ----------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("url", "page", "param", "expected"),
-    [
-        ("https://example.com/search?q=x", 2, "page", "https://example.com/search?q=x&page=2"),
-        ("https://example.com/search", 3, "p", "https://example.com/search?p=3"),
-        ("https://example.com/s?page=1&q=a", 2, "page", "https://example.com/s?q=a&page=2"),
-        ("https://example.com/s#top", 2, "page", "https://example.com/s?page=2#top"),
-        ("https://example.com/s?flag=&q=a+b", 4, "page", "https://example.com/s?flag=&q=a+b&page=4"),
-    ],
-)
-def test_build_paginated_url(url, page, param, expected):
-    assert browser.build_paginated_url(url, page, param=param) == expected
+# --- endpoints ----------------------------------------------------------
 
 
 def test_parse_cdp_endpoint():
@@ -56,26 +41,40 @@ def test_parse_cdp_endpoint():
 # --- ports and profiles --------------------------------------------------
 
 
-def test_each_browser_has_its_own_default_port():
-    ports = [core.settings.default_port(name) for name in core.SUPPORTED_BROWSERS]
-    assert ports == [9222, 9223, 9224]
+def test_each_browser_has_its_own_port_and_profile(tmp_path):
+    assert [core.settings.port(name) for name in core.SUPPORTED_BROWSERS] == [9222, 9223, 9224]
+    assert core.settings.cdp_url("chrome") == "http://127.0.0.1:9223"
+    assert core.settings.profile_dir("chrome") == tmp_path / "profiles" / "chrome_profile"
     with pytest.raises(ValueError):
-        core.settings.default_port("firefox")
+        core.settings.port("firefox")
 
 
-def test_default_port_uses_main_profile():
-    assert core._profile_dir("chrome", 9223).name == "chrome_profile"
-    assert core._profile_dir("chrome", 9222).name == "chrome_profile_9222"
+def test_ensure_browser_reuses_a_running_instance(monkeypatch):
+    monkeypatch.setattr(core, "_cdp_is_up", lambda url: True)
+    monkeypatch.setattr(core.subprocess, "Popen", lambda *a, **k: pytest.fail("must not launch"))
+    assert core._ensure_browser("brave", headless=True) is None
 
 
-def test_remembered_port_round_trip_and_fallbacks():
-    assert core._remembered_port("edge") == 9224
-    core._remember_port("edge", 50123)
-    assert core._remembered_port("edge") == 50123
-    core._port_file("edge").write_text(json.dumps({"port": 70000}), encoding="utf-8")
-    assert core._remembered_port("edge") == 9224
-    core._port_file("edge").write_text("not json", encoding="utf-8")
-    assert core._remembered_port("edge") == 9224
+def test_ensure_browser_launches_on_the_persistent_profile(monkeypatch, tmp_path):
+    launched = []
+    process = FakeProcess()
+    monkeypatch.setattr(core, "_cdp_is_up", lambda url: bool(launched))
+    monkeypatch.setattr(core, "find_browser", lambda name: "brave-bin")
+    monkeypatch.setattr(core.subprocess, "Popen", lambda args, **k: launched.append(args) or process)
+    assert core._ensure_browser("brave", headless=False) is process
+    assert f"--user-data-dir={tmp_path / 'profiles' / 'brave_profile'}" in launched[0]
+    assert "--remote-debugging-port=9222" in launched[0]
+
+
+def test_ensure_browser_stops_a_browser_that_never_serves_cdp(monkeypatch):
+    process = FakeProcess()
+    process.poll = lambda: 1
+    monkeypatch.setattr(core, "_cdp_is_up", lambda url: False)
+    monkeypatch.setattr(core, "find_browser", lambda name: "brave-bin")
+    monkeypatch.setattr(core.subprocess, "Popen", lambda args, **k: process)
+    with pytest.raises(RuntimeError, match="exited before exposing CDP"):
+        core._ensure_browser("brave", headless=True)
+    assert process.terminated
 
 
 # --- starting and closing ----------------------------------------------
@@ -139,23 +138,6 @@ def test_close_leaves_attached_browser_running():
     calls = []
     asyncio.run(_session(calls, process=None).close(stop_browser=True))
     assert calls == ["stop"]
-
-
-def test_start_session_retries_on_fresh_profile(monkeypatch):
-    stuck = core._CdpServer(9222, FakeProcess())
-    fresh_server = core._CdpServer(50000, FakeProcess())
-    monkeypatch.setattr(core, "_start_cdp", lambda browser, headless, *, fresh: fresh_server if fresh else stuck)
-
-    async def attach(url):
-        if url == stuck.url:
-            raise RuntimeError("stuck")
-        return SimpleNamespace(process=None)
-
-    monkeypatch.setattr(core, "_attach", attach)
-    session = asyncio.run(core._start_session("brave", headless=True))
-    assert stuck.process.terminated
-    assert session.process is fresh_server.process
-    assert core._remembered_port("brave") == 50000
 
 
 def test_solve_captcha_needs_an_endpoint_for_foreign_pages():

@@ -2,3 +2,4 @@
 
 from .browser import *  # noqa: F403  (re-exports the public API listed in __all__)
 from .browser import __all__, __doc__  # noqa: F401
+from .dom import minimize_dom  # noqa: F401  (optional LLM outline; delete dom.py and this line to drop it)

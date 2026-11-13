@@ -1,8 +1,8 @@
-# browser: web scraping guide
+# browser: stealth automation guide
 
-`browser` is a single-file library (`browser/browser.py`) for scraping with a real browser. It
-starts Brave, Chrome or Edge as a normal app with its own profile, so you stay
-signed in between runs. It controls that browser with
+`browser` is a small library (core in `browser/browser.py`) for automating a real browser. It
+starts the Brave, Chrome or Edge installed on this machine as a normal app with
+a persistent automation profile, so you stay signed in between runs. It controls that browser with
 [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright), a stealth fork
 of Playwright, and solves CAPTCHAs with
 [SeleniumBase](https://github.com/seleniumbase/SeleniumBase).
@@ -68,7 +68,7 @@ own JavaScript variables. To read one, such as `window.__INITIAL_STATE__`, pass
 state = await page.evaluate("() => window.__INITIAL_STATE__", isolated_context=False)
 ```
 
-## Scrape many pages in parallel
+## Run many tabs in parallel
 
 `scrape_pages` opens each URL in its own tab, runs your extractor on it, and
 returns the results in the same order as the URLs. Before your extractor runs,
@@ -81,8 +81,7 @@ async def extract_books(tab, url):
         "article.product_pod h3 a", "links => links.map(a => a.title)"
     )
 
-urls = [browser.build_paginated_url("https://shop.example.com/search?q=lamp", n) for n in range(1, 6)]
-# -> https://shop.example.com/search?q=lamp&page=1 ... &page=5
+urls = [f"https://shop.example.com/search?q=lamp&page={n}" for n in range(1, 6)]
 
 async with browser.async_browser_session() as session:
     pages = await browser.scrape_pages(session.context, urls, extract_books, max_concurrent_tabs=3)
@@ -98,9 +97,6 @@ When a page fails:
 |---|---|
 | `"raise"` (default) | Stops the remaining tabs and re-raises the first error. Nothing is silently lost. |
 | `"skip"` | Logs a warning for the failed URL and puts `None` in its place, so results still line up with `urls`. |
-
-If the site uses a different query parameter for paging, pass it with
-`build_paginated_url(url, 2, param="p")`.
 
 ## CAPTCHAs
 
@@ -171,6 +167,9 @@ it its own `data_dir`.
 
 Each browser has its own default port (Brave 9222, Chrome 9223, Edge 9224),
 so asking for one browser never attaches to another that is already running.
+Each browser has exactly one profile, `data_dir/profiles/<browser>_profile`.
+If it can't be opened the session raises; it never falls back to a fresh,
+signed-out profile.
 When a session that launched the browser ends, the browser is asked to close
 cleanly so its profile and logins are saved, and is only killed if it hangs.
 
@@ -198,6 +197,9 @@ out scripts, styles and hidden elements. Password values are never included.
 outline = await browser.minimize_dom(page, sample_repeated=True, max_lines=500)
 ```
 
+It lives in `browser/dom.py` and nothing else depends on it. To drop it, delete
+that file and its import line in `browser/__init__.py`.
+
 `sample_repeated=True` collapses long lists of identical items, such as 50
 product cards, into a few examples.
 
@@ -207,7 +209,7 @@ product cards, into a few examples.
 |---|---|
 | `Could not find 'brave' on Windows` | Install it, pick another browser, or set `settings.executables["brave"]`. |
 | `The browser exited before exposing CDP` | That profile is already open in another window of the same browser. Close it, or use a different `data_dir`. |
-| `Could not attach to browser CDP at ...` | The browser didn't respond. The library already retried once on a fresh profile, so close stray browser windows and rerun. |
+| `Could not attach to browser CDP at ...` | The browser didn't respond. Close stray windows of the automation browser and rerun, or raise `settings.attach_timeout`. |
 | `CAPTCHA at ... was not solved` | Use the [person-finishes-it fallback](#fallback-let-a-person-finish-it), or retry without `headless`. |
 | `solve_captcha() needs SeleniumBase` | `pip install seleniumbase` |
 | `HTTP 404 at ...` | The URL is wrong or the page is gone. Use `on_error="skip"` to continue past it. |
@@ -219,9 +221,8 @@ product cards, into a few examples.
 | `async_browser_session(browser="brave", *, cdp_url, headless, keep_open)` | Start or attach a browser for an `async with` block |
 | `BrowserSession` | What the block yields: `page`, `context`, `browser`, `cdp_url` |
 | `scrape_pages(context, urls, extractor, *, max_concurrent_tabs=5, on_error="raise")` | Many URLs in parallel tabs, results in order |
-| `build_paginated_url(url, n, *, param="page")` | Set `page=n` in a URL's query |
 | `has_captcha(page)` | Is an unsolved CAPTCHA showing? |
 | `solve_captcha(page, *, timeout=15)` | Solve it with SeleniumBase; `True` when the page is clear |
 | `wait_for_captcha_clear(page, timeout)` | Wait for a person to solve it |
-| `minimize_dom(page, ...)` | Compact page outline for an LLM |
+| `minimize_dom(page, ...)` | Compact page outline for an LLM (`browser/dom.py`, optional) |
 | `settings`, `find_browser` | Ports, profile folder, browser paths, timeouts |
